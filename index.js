@@ -19,9 +19,6 @@ const oauth2 = new jsforce.OAuth2({
 
 const conn = new jsforce.Connection({ oauth2 });
 
-/************************************
- * Salesforce OAuth Refresh Logic
- ************************************/
 async function connectSalesforce() {
   try {
     const response = await fetch(
@@ -43,14 +40,12 @@ async function connectSalesforce() {
 
     conn.accessToken = token.access_token;
     conn.instanceUrl = token.instance_url;
-
+    conn.refreshToken = process.env.SF_REFRESH_TOKEN;
     console.log('✅ Salesforce connected');
   } catch (err) {
     console.error('❌ Salesforce Connection Error:', err.message);
   }
 }
-
-// Initial connection on startup
 connectSalesforce();
 
 /************************************
@@ -58,16 +53,15 @@ connectSalesforce();
  ************************************/
 app.use((req, res, next) => {
   if (req.path === '/health') return next();
-
   const apiKey = req.headers['x-api-key'];
-  if (!apiKey || apiKey !== process.env.API_KEY) {
+  if (!apiKey || apiKey !== process.env.X_API_KEY) {
     return res.status(403).json({ error: 'Forbidden – Invalid API Key' });
   }
   next();
 });
 
 /************************************
- * Helper Functions
+ * HELPER: Split Name
  ************************************/
 function splitName(fullName = '') {
   const parts = fullName.trim().split(' ');
@@ -77,105 +71,112 @@ function splitName(fullName = '') {
   };
 }
 
-function normalizeProjectType(value) {
-  if (!value) return null;
-  const map = {
-    kitchen: 'Kitchen',
-    bathroom: 'Bathroom',
-    'full home': 'Full Home',
-    basement: 'Basement',
-    addition: 'Addition',
-    exterior: 'Exterior'
-  };
-  return map[value.toLowerCase()] || 'Other';
+/************************************
+ * HELPER: Smart Project Detection
+ * Scans BOTH Project Type and Scope for keywords
+ ************************************/
+function detectProjectType(projectInput, scopeInput) {
+  // Combine both inputs into one long string to search
+  const textToScan = (projectInput + ' ' + scopeInput).toLowerCase();
+
+  // --- PRIORITY 1: Specific Phrases (Longer matches first) ---
+  if (textToScan.includes('kitchen remodeling')) return 'Kitchen remodeling';
+  if (textToScan.includes('bathroom remodeling')) return 'Bathroom remodeling';
+  if (textToScan.includes('full home')) return 'Full Home Remodel';
+  if (textToScan.includes('whole house')) return 'Full Home Remodel';
+  if (textToScan.includes('new room')) return 'New room addition';
+  if (textToScan.includes('home interior')) return 'Home interior design';
+  if (textToScan.includes('interior design')) return 'Home interior design';
+
+  // --- PRIORITY 2: Single Words ---
+  if (textToScan.includes('kitchen')) return 'Kitchen';
+  if (textToScan.includes('bath')) return 'Bathroom';
+  if (textToScan.includes('basement')) return 'Basement';
+  if (textToScan.includes('exterior')) return 'Exterior';
+  if (textToScan.includes('deck')) return 'Exterior';
+  if (textToScan.includes('roof')) return 'Exterior';
+  if (textToScan.includes('adu')) return 'ADU';
+  if (textToScan.includes('addition')) return 'Addition';
+
+  // --- PRIORITY 3: General Fallback ---
+  if (textToScan.includes('remodel')) return 'Remodeling';
+
+  // Return undefined so Salesforce can leave it blank or handle it manually
+  return undefined; 
 }
 
 function mapLeadSource(source) {
+  if (!source) return 'Referral';
   const map = {
     'google lsa': 'Google LSA',
     'google calls': 'Google Calls',
     'google form': 'Google Form',
-    yelp: 'Yelp',
-    houzz: 'Houzz',
-    angi: 'Angi',
-    porch: 'Porch',
-    thumbtack: 'Thumbtack',
-    meta: 'Meta'
+    'yelp': 'Yelp',
+    'houzz': 'Houzz',
+    'angi': 'Angi',
+    'porch': 'Porch',
+    'thumbtack': 'Thumbtack',
+    'meta': 'Meta'
   };
-  return map[source?.toLowerCase()] || 'Referral';
+  return map[source.toString().toLowerCase().trim()] || 'Referral';
 }
 
 /************************************
- * CREATE LEAD API (The Core Logic)
+ * CREATE LEAD API
  ************************************/
 app.post('/lead', async (req, res) => {
   try {
-    // Check if token is expired/missing
     if (!conn.accessToken) await connectSalesforce();
 
-    const { firstName, lastName } = splitName(req.body.full_name);
-    const rawSource = req.body.source;
+    // 1. Get Raw Data
+    const fullName = req.body.full_name || req.body.Name || 'Unknown Lead';
+    const rawSource = req.body.source || req.body.Source;
+    const rawProject = req.body.project_type || req.body['Project Type'] || '';
+    const rawScope = req.body.scope || req.body.description || req.body['Scope of Work'] || '';
+
+    // 2. Process Data
+    const { firstName, lastName } = splitName(fullName);
     const leadSource = mapLeadSource(rawSource);
     
-    // ALERT: Unknown source check
-    if (leadSource === 'Referral') {
-      console.warn(`🚨 ALERT: Unrecognized source: "${rawSource}". Lead may not trigger Round-Robin.`);
-    }
+    // 3. Detect Project Type using BOTH fields
+    const finalProjectType = detectProjectType(rawProject, rawScope);
 
+    // 4. Prepare Salesforce Payload
     const leadPayload = {
       FirstName: firstName,
       LastName: lastName,
-      Company: req.body.company || 'Unknown',
-      Email: req.body.email || undefined,
-      Phone: req.body.phone || undefined,
-      
-      // CRITICAL: Mapping to your Custom Field for Day 9 Flow
-      Lead_Source__c: leadSource, 
-      
-      Project_Type__c: normalizeProjectType(req.body.project_type) || undefined,
-      Scope_of_Work__c: req.body.scope || undefined
+      Company: req.body.company || req.body.Company || 'Unknown',
+      Email: req.body.email || req.body.Email || undefined,
+      Phone: req.body.phone || req.body.Phone || undefined,
+      Lead_Source__c: leadSource,
+      Project_Type__c: finalProjectType, // Now auto-detected from Scope too
+      Scope_of_Work__c: rawScope
     };
 
-    console.log('📤 Payload:', leadPayload);
+    console.log('📤 Sending Payload:', leadPayload);
 
-    /* CRITICAL: The Sforce-Auto-Assign header triggers Assignment Rules, 
-      which then triggers your Round-Robin Flow
-    */
     const result = await conn.sobject('Lead').create(leadPayload, {
-      headers: {
-        'Sforce-Auto-Assign': 'true'
-      }
+      headers: { 'Sforce-Auto-Assign': 'true' }
     });
 
-    console.log(`✅ Success: Lead ${result.id} created via ${leadSource}`);
+    console.log(`✅ Success: Lead ${result.id} Created`);
 
     res.status(201).json({
       success: true,
       leadId: result.id,
-      assignedSource: leadSource
+      detectedProject: finalProjectType
     });
 
   } catch (err) {
-    console.error('❌ CRITICAL ERROR:', err.message);
+    console.error('❌ ERROR:', err.message);
+    // Respond with 500 but include the error message
     res.status(500).json({ error: err.message });
   }
 });
 
-/************************************
- * Health Check & Status
- ************************************/
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    salesforceConnected: !!conn.accessToken,
-    timestamp: new Date().toISOString()
-  });
+  res.json({ status: 'ok', salesforceConnected: !!conn.accessToken });
 });
 
-/************************************
- * Start Server
- ************************************/
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`🚀 API Server running on port ${PORT}`)
-);
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
